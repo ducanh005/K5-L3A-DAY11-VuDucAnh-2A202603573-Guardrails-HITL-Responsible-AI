@@ -41,17 +41,97 @@ class MonitoringAlert:
     judge_checks: int = 0
     judge_fails: int = 0
 
-    def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+    def record_request(
+        self,
+        *,
+        blocked: bool = False,
+        rate_limited: bool = False,
+        judge_checked: bool = False,
+        judge_failed: bool = False,
+    ) -> None:
+        """Increment monitoring counters after a request completes."""
+        self.total_requests += 1
+        if blocked:
+            self.blocked_requests += 1
+        if rate_limited:
+            self.rate_limit_hits += 1
+        if judge_checked:
+            self.judge_checks += 1
+        if judge_failed:
+            self.judge_fails += 1
 
-    def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+    def check_metrics(self) -> list[Alert]:
+        """Compute rates and append Alert objects when thresholds are exceeded."""
+        block_rate = (
+            self.blocked_requests / self.total_requests
+            if self.total_requests
+            else 0.0
+        )
+        judge_fail_rate = (
+            self.judge_fails / self.judge_checks if self.judge_checks else 0.0
+        )
+
+        existing = {(a.metric, a.value, a.threshold) for a in self.alerts}
+        candidates: list[Alert] = []
+
+        if self.total_requests > 0 and block_rate > self.block_rate_threshold:
+            candidates.append(
+                Alert(
+                    metric="block_rate",
+                    value=round(block_rate, 4),
+                    threshold=self.block_rate_threshold,
+                    message=(
+                        f"Block rate {block_rate:.1%} exceeded threshold "
+                        f"{self.block_rate_threshold:.1%}."
+                    ),
+                )
+            )
+
+        if self.rate_limit_hits >= self.rate_limit_hit_threshold:
+            candidates.append(
+                Alert(
+                    metric="rate_limit_hits",
+                    value=float(self.rate_limit_hits),
+                    threshold=float(self.rate_limit_hit_threshold),
+                    message=(
+                        f"Rate limit hits ({self.rate_limit_hits}) reached/exceeded "
+                        f"threshold ({self.rate_limit_hit_threshold})."
+                    ),
+                )
+            )
+
+        if self.judge_checks > 0 and judge_fail_rate > self.judge_fail_rate_threshold:
+            candidates.append(
+                Alert(
+                    metric="judge_fail_rate",
+                    value=round(judge_fail_rate, 4),
+                    threshold=self.judge_fail_rate_threshold,
+                    message=(
+                        f"Judge fail rate {judge_fail_rate:.1%} exceeded threshold "
+                        f"{self.judge_fail_rate_threshold:.1%}."
+                    ),
+                )
+            )
+
+        new_alerts: list[Alert] = []
+        for alert in candidates:
+            key = (alert.metric, alert.value, alert.threshold)
+            if key not in existing:
+                existing.add(key)
+                self.alerts.append(alert)
+                new_alerts.append(alert)
+        return new_alerts
+
+    def export_json(self, filepath: str | None = None) -> str:
+        """Write metrics + alerts to JSON under repo-root ``outputs/`` by default."""
+        if not self.alerts:
+            self.check_metrics()
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.snapshot(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (

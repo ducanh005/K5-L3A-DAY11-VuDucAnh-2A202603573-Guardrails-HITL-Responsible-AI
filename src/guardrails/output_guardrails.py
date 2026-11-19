@@ -6,13 +6,35 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+
+_PROTECTED_SECRETS = tuple(
+    sorted({s for s in DEMO_SECRETS if s}, key=len, reverse=True)
+)
+_PROTECTED_SECRET_ALNUM = tuple(
+    sorted(
+        {
+            needle
+            for s in DEMO_SECRETS
+            if (needle := re.sub(r"[^a-z0-9]", "", s.lower()))
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_BENIGN_PASSWORD_WORDS = (
+    "not|never|required|needed|mandatory|optional|protected|encrypted|hashed|"
+    "stored|confidential|private|secret|safe|secure|expired|invalid|incorrect|"
+    "wrong|missing|empty|reset|changed|updated|sent|available|recommended|used|set"
+)
 
 
 # ============================================================
@@ -36,24 +58,57 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    if not response:
+        return {"safe": True, "issues": [], "redacted": "" if response is None else response}
+
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # Order matters: match specific secrets/DB hosts and 9/12-digit national IDs before
+    # 10/11-digit VN phone numbers so a 12-digit CCCD starting with 0 is not truncated.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "api_key": r"\bsk-[a-zA-Z0-9_-]{4,}\b",
+        "password": (
+            r"\b(?:password|passwd|mật\s*khẩu)\s*(?:"
+            r"[:=]\s*[^\s,;]+(?<![.,;:])"
+            rf"|(?:is|là)\s+(?!(?:{_BENIGN_PASSWORD_WORDS})\b)[^\s,;]+(?<![.,;:])"
+            r")"
+        ),
+        "internal_db": r"\bdb\.vinbank\.internal(?::\d+)?\b",
+        "email": r"\b[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}\b",
+        "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+        "phone": r"(?<!\d)(?:\+84|0)\d{9,10}(?!\d)",
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    # Fallback: catch bare protected secrets or obfuscated spacing/punctuation leaks.
+    for secret in _PROTECTED_SECRETS:
+        pattern = re.escape(secret)
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
+        if matches:
+            issues.append(f"protected_secret: {len(matches)} found")
+            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+
+    alnum_remaining = re.sub(
+        r"[^a-z0-9]", "", unicodedata.normalize("NFKC", redacted).lower()
+    )
+    for needle in _PROTECTED_SECRET_ALNUM:
+        if needle in alnum_remaining:
+            obfuscated_pattern = r"[\W_]*".join(re.escape(ch) for ch in needle)
+            updated, count = re.subn(
+                obfuscated_pattern, "[REDACTED]", redacted, flags=re.IGNORECASE
+            )
+            if count:
+                redacted = updated
+                issues.append("protected_secret: obfuscated leak found")
+                alnum_remaining = re.sub(
+                    r"[^a-z0-9]", "", unicodedata.normalize("NFKC", redacted).lower()
+                )
 
     return {
         "safe": len(issues) == 0,
@@ -149,11 +204,16 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
         text = ""
-        if hasattr(llm_response, "content") and llm_response.content:
+        if (
+            hasattr(llm_response, "content")
+            and llm_response.content
+            and getattr(llm_response.content, "parts", None)
+        ):
             for part in llm_response.content.parts:
                 if hasattr(part, "text") and part.text:
                     text += part.text
@@ -167,21 +227,39 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_issues = []
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            self.last_issues = list(filtered["issues"])
+            response_text = filtered["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)],
+            )
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result.get("safe", True):
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text=(
+                                "I cannot share this response due to VinBank safety "
+                                "policy. How else can I assist you with your banking needs?"
+                            )
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
